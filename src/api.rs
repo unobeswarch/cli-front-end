@@ -85,9 +85,9 @@ pub struct AuthResponse {
 
 impl ApiClient {
     /// Create an ApiClient configured from the environment variable
-    /// `API_GATEWAY_URL` or fallback to `http://localhost:8081`.
+    /// `API_GATEWAY_URL` or fallback to `http://localhost:8080`.
     pub fn from_env() -> Result<Self> {
-        let base_url = std::env::var("API_GATEWAY_URL").unwrap_or_else(|_| "http://localhost:8081".into());
+        let base_url = std::env::var("API_GATEWAY_URL").unwrap_or_else(|_| "http://localhost:8080".into());
         let client = Client::builder()
             .build()
             .context("Failed to build HTTP client")?;
