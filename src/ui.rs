@@ -34,8 +34,21 @@ use base64::Engine as _;
 // Optional file dialog support
 use rfd::FileDialog;
 
+// small helper to clear previous terminal lines; used to hide the
+// initial "Continuar/Cancelar" prompt when the user chooses to continue.
+fn clear_previous_lines(mut n: u16) {
+    use std::io::stdout;
+    use crossterm::{execute, cursor::MoveUp, terminal::{Clear, ClearType}, cursor::MoveToColumn};
+    let mut out = stdout();
+    // safety: loop a bounded number of times; ignore errors — clearing is best-effort
+    while n > 0 {
+        let _ = execute!(out, MoveUp(1), MoveToColumn(0), Clear(ClearType::CurrentLine));
+        n -= 1;
+    }
+}
+
 // Shared header width used by the banner and separators so they match.
-const HEADER_WIDTH: usize = 60;
+const HEADER_WIDTH: usize = 80;
 // Minimum spinner display time in milliseconds so short operations still
 // show a visible spinner for the user.
 const MIN_SPINNER_MS: u64 = 1500;
@@ -121,12 +134,17 @@ pub fn main_menu(mut api: ApiClient) -> Result<()> {
             "Registrarse" => {
                 // Show a titled section for registration
                 print_section("NeumoDiagnostics - Registro");
-                handle_register(&api)?;
+                // Allow user to cancel registration and return to the main menu
+                if let Err(e) = handle_register(&api) {
+                    // If the handler returned an error, surface it; otherwise continue
+                    println!("Error en el flujo de registro: {}", e);
+                }
                 print_separator();
             }
             "Iniciar sesión" => {
                 // Show a titled section for login
                 print_section("NeumoDiagnostics - Iniciar sesión");
+                // handle_login returns Ok(Some(token)) on success, Ok(None) when cancelled or failed
                 if let Some(token) = handle_login(&api)? {
                     api.set_token(&token);
                     // Preguntar si se recuerda la sesión (Sí/No en español)
@@ -158,8 +176,14 @@ pub fn main_menu(mut api: ApiClient) -> Result<()> {
                     continue;
                 }
 
-                let pick_methods = vec!["Seleccionar archivo (GUI)", "Ingresar ruta manualmente"];
+                // Provide an explicit cancel option so the user can return to the menu
+                let pick_methods = vec!["Seleccionar archivo (GUI)", "Ingresar ruta manualmente", "Cancelar"];
                 let pick = pick_methods[Select::new().items(&pick_methods).default(0).interact()?];
+
+                if pick == "Cancelar" {
+                    println!("Operación cancelada. Volviendo al menú.");
+                    continue;
+                }
 
                 let pb_opt: Option<PathBuf> = if pick == "Seleccionar archivo (GUI)" {
                     match FileDialog::new().add_filter("Imagen", &["jpg", "jpeg", "png"]).pick_file() {
@@ -171,8 +195,14 @@ pub fn main_menu(mut api: ApiClient) -> Result<()> {
                     }
                 } else {
                     let raw_path: String = Input::new().with_prompt("Ruta del archivo de imagen").interact_text()?;
-                    let path = raw_path.trim().trim_matches('"').trim_matches('\'').to_string();
-                    Some(PathBuf::from(path))
+                    let trimmed = raw_path.trim();
+                    if trimmed.is_empty() {
+                        println!("Ruta vacía: operación cancelada.");
+                        None
+                    } else {
+                        let path = trimmed.trim_matches('"').trim_matches('\'').to_string();
+                        Some(PathBuf::from(path))
+                    }
                 };
 
                 if pb_opt.is_none() {
@@ -238,6 +268,21 @@ pub fn main_menu(mut api: ApiClient) -> Result<()> {
 
 /// Collect input fields for registration and call `ApiClient::register`.
 fn handle_register(api: &ApiClient) -> Result<()> {
+    // Allow immediate cancel of the registration flow
+    let start_idx = Select::new()
+        .with_prompt("¿Desea continuar con el registro o cancelar?")
+        .items(&["Continuar", "Cancelar"]) 
+        .default(0)
+        .interact()?;
+    if start_idx == 1 {
+        println!("Registro cancelado. Volviendo al menú.");
+        return Ok(());
+    }
+    // If the user chose to continue, clean up the prompt lines so the
+    // terminal doesn't keep showing the temporary selector. 6 lines is
+    // a conservative clearance for the prompt + selector display.
+    clear_previous_lines(1);
+
     // `Input::interact_text()` prompts the user for input and returns it.
     let nombre: String = Input::new().with_prompt("Nombre completo").interact_text()?;
     let edad: i32 = Input::new().with_prompt("Edad").interact_text()?;
@@ -248,12 +293,27 @@ fn handle_register(api: &ApiClient) -> Result<()> {
     let identificacion: String = Input::new().with_prompt("Identificación").interact_text()?;
     let correo: String = Input::new().with_prompt("Correo electrónico").interact_text()?;
     // `Password` hides input in terminal for passwords. Request confirmation.
-    let contrasena: String = Password::new().with_prompt("Contraseña").interact()?;
-    let contrasena_confirm: String = Password::new().with_prompt("Confirmar contraseña").interact()?;
-    if contrasena != contrasena_confirm {
-        println!("Las contraseñas no coinciden. Intente registrarse de nuevo.");
-        return Ok(());
-    }
+    // If the passwords don't match, allow the user to retry entering only
+    // the passwords or cancel the registration — do not force restarting
+    // the whole form.
+    let contrasena: String = loop {
+        let p = Password::new().with_prompt("Contraseña").interact()?;
+        let pc = Password::new().with_prompt("Confirmar contraseña").interact()?;
+        if p == pc {
+            break p;
+        }
+        println!("Las contraseñas no coinciden.");
+        let retry = Select::new()
+            .with_prompt("¿Desea reintentar la contraseña o cancelar el registro?")
+            .items(&["Reintentar", "Cancelar"]) 
+            .default(0)
+            .interact()?;
+        if retry == 1 {
+            println!("Registro cancelado. Volviendo al menú.");
+            return Ok(());
+        }
+        // otherwise loop and ask for passwords again
+    };
     // Keep the consent choice visible and persistent. Use Spanish Sí/No selection
     let acepta_idx = Select::new()
         .with_prompt("¿Acepta el tratamiento de datos?")
@@ -336,6 +396,19 @@ fn handle_register(api: &ApiClient) -> Result<()> {
 
 /// Collect credentials and perform login, returning the JWT token if OK.
 fn handle_login(api: &ApiClient) -> Result<Option<String>> {
+    // Allow immediate cancel of the login flow
+    let start_idx = Select::new()
+        .with_prompt("¿Desea continuar con el inicio de sesión o cancelar?")
+        .items(&["Continuar", "Cancelar"]) 
+        .default(0)
+        .interact()?;
+    if start_idx == 1 {
+        println!("Inicio de sesión cancelado. Volviendo al menú.");
+        return Ok(None);
+    }
+    // Hide the initial selector when continuing so the form appears cleanly.
+    clear_previous_lines(1);
+
     let correo: String = Input::new().with_prompt("Correo electrónico").interact_text()?;
     let contrasena: String = Password::new().with_prompt("Contraseña").interact()?;
     let req = AuthRequest { correo, contrasena };
